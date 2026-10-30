@@ -3,11 +3,16 @@
 // Radio receive present but NOT checked in control loop (to be re-enabled later)
 
 #include <Arduino.h>
+#include <SPI.h>
+#include <RF24.h>
 #include <Wire.h>
 #include <EEPROM.h>
 #include <U8g2lib.h>
+#include "radio_config.h"
 
 // ─── Pin Definitions ───
+const uint8_t CE_PIN  = 9;
+const uint8_t CSN_PIN = 10;
 const uint8_t LED_PIN = 13;
 
 // Motor pins (back to original wiring)
@@ -43,11 +48,15 @@ int acc_calibration_value = 1600;  // Default (your tuned value)
 float pid_p_gain = 20.5;
 float pid_i_gain = 1.5;
 float pid_d_gain = 0.0;
-float turning_speed = 30.0;
-float max_target_speed = 150.0;
+float turning_speed = 80.0;
+float max_target_speed = 200.0;
 
 // ─── Global State ───
+RF24 radio(CE_PIN, CSN_PIN);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C tuningDisplay(U8G2_R0, U8X8_PIN_NONE);
+CommandPacket lastPacket;
+unsigned long lastReceiveTime = 0;
+bool radioTimedOut = true;  // Start as timed out until first packet arrives
 
 unsigned long loop_timer = 0;
 long gyro_pitch_calibration_value = 0;
@@ -259,6 +268,16 @@ void setup() {
   gyro_yaw_calibration_value /= GYRO_CALIBRATION_SAMPLES;
   digitalWrite(LED_PIN, LOW);
 
+  // Radio init
+  if (radio.begin()) {
+    radio.setChannel(RADIO_CHANNEL);
+    radio.setDataRate(RF24_250KBPS);
+    radio.setPALevel(RF24_PA_MAX);
+    radio.setAutoAck(true);
+    radio.openReadingPipe(1, RADIO_PIPE_ADDRESS);
+    radio.startListening();
+  }
+
   // Timer1: 20µs ISR (uses Timer1 to avoid pin 3/Timer2 conflict)
   TCCR1A = 0;
   TCCR1B = 0;
@@ -333,6 +352,32 @@ void loop() {
   pid_output_left = pid_output;
   pid_output_right = pid_output;
 
+  // ─── Movement commands (from radio) ───
+  if (!radioTimedOut) {
+    if (lastPacket.speed > 5) {
+      if (pid_setpoint > -2.5) pid_setpoint -= 0.07;
+      if (pid_output > max_target_speed * -1) pid_setpoint -= 0.005;
+    }
+    else if (lastPacket.speed < -5) {
+      if (pid_setpoint < 2.5) pid_setpoint += 0.07;
+      if (pid_output < max_target_speed) pid_setpoint += 0.005;
+    }
+    else {
+      if (pid_setpoint > 0.5) pid_setpoint -= 0.05;
+      else if (pid_setpoint < -0.5) pid_setpoint += 0.05;
+      else pid_setpoint = 0;
+    }
+
+    if (lastPacket.turn < -5) {
+      pid_output_left -= turning_speed;
+      pid_output_right += turning_speed;
+    }
+    else if (lastPacket.turn > 5) {
+      pid_output_left += turning_speed;
+      pid_output_right -= turning_speed;
+    }
+  }
+
   // ─── Non-linear stepper compensation ───
   if (pid_output_left > 0) pid_output_left = 405 - (1 / (pid_output_left + 9)) * 5500;
   else if (pid_output_left < 0) pid_output_left = -405 - (1 / (pid_output_left - 9)) * 5500;
@@ -355,6 +400,22 @@ void loop() {
   handleTuningButtons();
   if (start == 0) {
     updateTuningDisplay();
+  }
+
+  // ─── Radio check (only if spare time available before deadline) ───
+  // SPI takes ~150µs — only do it if we have >200µs before loop_timer expires
+  if (loop_timer - micros() > 200) {
+    if (radio.available()) {
+      radio.read(&lastPacket, sizeof(lastPacket));
+      lastReceiveTime = millis();
+      radioTimedOut = false;
+    }
+    // Timeout check
+    if (millis() - lastReceiveTime > 500) {
+      radioTimedOut = true;
+      lastPacket.speed = 0;
+      lastPacket.turn = 0;
+    }
   }
 
   // ─── Wait for loop timer ───

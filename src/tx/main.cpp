@@ -268,7 +268,7 @@ void loop() {
     delay(2);
     ADCSRA |= _BV(ADSC);
     while (bit_is_set(ADCSRA, ADSC));
-    batteryVoltageMv = (int)(1083740L / ADC);
+    batteryVoltageMv = (int)(1131349L / ADC);
 
     // Map voltage from 3000mV (0%) to 4200mV (100%), clamped
     batteryPercent = constrain(map(batteryVoltageMv, 3000, 4200, 0, 100), 0, 100);
